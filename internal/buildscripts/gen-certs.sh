@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+#
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
 
 # This script is used to create the CA, server and client's certificates and keys required by unit tests.
 # These certificates use the Subject Alternative Name extension rather than the Common Name, which will be unsupported from Go 1.15.
@@ -9,14 +12,16 @@ usage() {
   echo "-d  Dry-run mode. No project files will not be modified. Default: 'false'"
   echo "-m  Domain name to use in the certificate. Default: 'localhost'"
   echo "-o  Output directory where certificates will be written to. Default: '.'; the current directory"
+  echo "-s  A suffix for the generated certificate. Default: \"\"; an empty string"
   exit 1
 }
 
 dry_run=false
 domain="localhost"
 output_dir="."
+suffix=""
 
-while getopts "dm:o:" o; do
+while getopts "dm:o:s:" o; do
     case "${o}" in
         d)
             dry_run=true
@@ -26,6 +31,9 @@ while getopts "dm:o:" o; do
             ;;
         o)
             output_dir=$OPTARG
+            ;;
+        s)
+            suffix=$OPTARG
             ;;
         *)
             usage
@@ -37,7 +45,7 @@ shift $((OPTIND-1))
 set -ex
 
 # Create temp dir for generated files.
-tmp_dir=$(mktemp -d -t certificates)
+tmp_dir=$(mktemp -d -t certificatesXXX)
 clean_up() {
     ARG=$?
     if [ $dry_run = true ]; then
@@ -79,47 +87,45 @@ EOF
 gen_ssl_conf "$domain" "$tmp_dir/ssl.conf"
 
 # Create CA (accept defaults from prompts).
-openssl genrsa -out "$tmp_dir/ca.key"  2048
-openssl req -new -key "$tmp_dir/ca.key" -x509 -days 3650 -out "$tmp_dir/ca.crt" -config "$tmp_dir/ssl.conf"
+openssl genrsa -out "$tmp_dir/ca${suffix}.key"  2048
+openssl req -new -key "$tmp_dir/ca${suffix}.key" -x509 -days 3650 -out "$tmp_dir/ca${suffix}.crt" -config "$tmp_dir/ssl.conf"
 
 # Create client and server keys.
-openssl genrsa -out "$tmp_dir/server.key" 2048
-openssl genrsa -out "$tmp_dir/client.key" 2048
+openssl genrsa -out "$tmp_dir/server${suffix}.key" 2048
+openssl genrsa -out "$tmp_dir/client${suffix}.key" 2048
 
 # Create certificate sign request using the above created keys.
-openssl req -new -nodes -key "$tmp_dir/server.key" -out "$tmp_dir/server.csr" -config "$tmp_dir/ssl.conf"
-openssl req -new -nodes -key "$tmp_dir/client.key" -out "$tmp_dir/client.csr" -config "$tmp_dir/ssl.conf"
+openssl req -new -nodes -key "$tmp_dir/server${suffix}.key" -out "$tmp_dir/server${suffix}.csr" -config "$tmp_dir/ssl.conf"
+openssl req -new -nodes -key "$tmp_dir/client${suffix}.key" -out "$tmp_dir/client${suffix}.csr" -config "$tmp_dir/ssl.conf"
 
 # Creating the client and server certificates.
 openssl x509 -req \
              -sha256 \
              -days 3650 \
-             -in "$tmp_dir/server.csr" \
-             -signkey "$tmp_dir/server.key" \
-             -out "$tmp_dir/server.crt" \
+             -in "$tmp_dir/server${suffix}.csr" \
+             -out "$tmp_dir/server${suffix}.crt" \
              -extensions req_ext \
-             -CA "$tmp_dir/ca.crt" \
-             -CAkey "$tmp_dir/ca.key" \
+             -CA "$tmp_dir/ca${suffix}.crt" \
+             -CAkey "$tmp_dir/ca${suffix}.key" \
              -CAcreateserial \
              -extfile "$tmp_dir/ssl.conf"
 openssl x509 -req \
              -sha256 \
              -days 3650 \
-             -in "$tmp_dir/client.csr" \
-             -signkey "$tmp_dir/client.key" \
-             -out "$tmp_dir/client.crt" \
+             -in "$tmp_dir/client${suffix}.csr" \
+             -out "$tmp_dir/client${suffix}.crt" \
              -extensions req_ext \
-             -CA "$tmp_dir/ca.crt" \
-             -CAkey "$tmp_dir/ca.key" \
+             -CA "$tmp_dir/ca${suffix}.crt" \
+             -CAkey "$tmp_dir/ca${suffix}.key" \
              -CAcreateserial \
              -extfile "$tmp_dir/ssl.conf"
 
 # Copy files if not in dry-run mode.
 if [ $dry_run = false ]; then
-  cp "$tmp_dir/ca.crt" \
-     "$tmp_dir/client.crt" \
-     "$tmp_dir/client.key" \
-     "$tmp_dir/server.crt" \
-     "$tmp_dir/server.key" \
+  cp "$tmp_dir/ca${suffix}.crt" \
+     "$tmp_dir/client${suffix}.crt" \
+     "$tmp_dir/client${suffix}.key" \
+     "$tmp_dir/server${suffix}.crt" \
+     "$tmp_dir/server${suffix}.key" \
      "$output_dir"
 fi

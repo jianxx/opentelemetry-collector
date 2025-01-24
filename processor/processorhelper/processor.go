@@ -1,18 +1,9 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package processorhelper
+//go:generate mdatagen metadata.yaml
+
+package processorhelper // import "go.opentelemetry.io/collector/processor/processorhelper"
 
 import (
 	"errors"
@@ -20,11 +11,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"go.opentelemetry.io/collector/component/componenthelper"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/consumer/consumerhelper"
-	"go.opentelemetry.io/collector/internal/obsreportconfig/obsmetrics"
+	"go.opentelemetry.io/collector/processor/internal"
 )
 
 // ErrSkipProcessingData is a sentinel value to indicate when traces or metrics should intentionally be dropped
@@ -33,51 +22,60 @@ import (
 var ErrSkipProcessingData = errors.New("sentinel error to skip processing data from the remainder of the pipeline")
 
 // Option apply changes to internalOptions.
-type Option func(*baseSettings)
+type Option interface {
+	apply(*baseSettings)
+}
+
+type optionFunc func(*baseSettings)
+
+func (of optionFunc) apply(e *baseSettings) {
+	of(e)
+}
 
 // WithStart overrides the default Start function for an processor.
 // The default shutdown function does nothing and always returns nil.
-func WithStart(start componenthelper.StartFunc) Option {
-	return func(o *baseSettings) {
-		o.componentOptions = append(o.componentOptions, componenthelper.WithStart(start))
-	}
+func WithStart(start component.StartFunc) Option {
+	return optionFunc(func(o *baseSettings) {
+		o.StartFunc = start
+	})
 }
 
 // WithShutdown overrides the default Shutdown function for an processor.
 // The default shutdown function does nothing and always returns nil.
-func WithShutdown(shutdown componenthelper.ShutdownFunc) Option {
-	return func(o *baseSettings) {
-		o.componentOptions = append(o.componentOptions, componenthelper.WithShutdown(shutdown))
-	}
+func WithShutdown(shutdown component.ShutdownFunc) Option {
+	return optionFunc(func(o *baseSettings) {
+		o.ShutdownFunc = shutdown
+	})
 }
 
 // WithCapabilities overrides the default GetCapabilities function for an processor.
 // The default GetCapabilities function returns mutable capabilities.
 func WithCapabilities(capabilities consumer.Capabilities) Option {
-	return func(o *baseSettings) {
-		o.consumerOptions = append(o.consumerOptions, consumerhelper.WithCapabilities(capabilities))
-	}
+	return optionFunc(func(o *baseSettings) {
+		o.consumerOptions = append(o.consumerOptions, consumer.WithCapabilities(capabilities))
+	})
 }
 
 type baseSettings struct {
-	componentOptions []componenthelper.Option
-	consumerOptions  []consumerhelper.Option
+	component.StartFunc
+	component.ShutdownFunc
+	consumerOptions []consumer.Option
 }
 
 // fromOptions returns the internal settings starting from the default and applying all options.
 func fromOptions(options []Option) *baseSettings {
 	// Start from the default options:
 	opts := &baseSettings{
-		consumerOptions: []consumerhelper.Option{consumerhelper.WithCapabilities(consumer.Capabilities{MutatesData: true})},
+		consumerOptions: []consumer.Option{consumer.WithCapabilities(consumer.Capabilities{MutatesData: true})},
 	}
 
 	for _, op := range options {
-		op(opts)
+		op.apply(opts)
 	}
 
 	return opts
 }
 
-func spanAttributes(id config.ComponentID) trace.EventOption {
-	return trace.WithAttributes(attribute.String(obsmetrics.ProcessorKey, id.String()))
+func spanAttributes(id component.ID) trace.EventOption {
+	return trace.WithAttributes(attribute.String(internal.ProcessorKey, id.String()))
 }

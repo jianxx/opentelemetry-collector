@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package logs
 
@@ -23,104 +12,100 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/consumer/consumertest"
-	"go.opentelemetry.io/collector/internal/testdata"
-	"go.opentelemetry.io/collector/model/otlpgrpc"
+	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
+	"go.opentelemetry.io/collector/pdata/testdata"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
+	"go.opentelemetry.io/collector/receiver/receivertest"
 )
 
 func TestExport(t *testing.T) {
+	ld := testdata.GenerateLogs(1)
+	req := plogotlp.NewExportRequestFromLogs(ld)
+
 	logSink := new(consumertest.LogsSink)
-
-	addr, doneFn := otlpReceiverOnGRPCServer(t, logSink)
-	defer doneFn()
-
-	traceClient, traceClientDoneFn, err := makeLogsServiceClient(addr)
-	require.NoError(t, err, "Failed to create the TraceServiceClient: %v", err)
-	defer traceClientDoneFn()
-
-	ld := testdata.GenerateLogsOneLogRecord()
-	// Keep log data to compare the test result against it
-	// Clone needed because OTLP proto XXX_ fields are altered in the GRPC downstream
-	logData := ld.Clone()
-	req := otlpgrpc.NewLogsRequest()
-	req.SetLogs(ld)
-
-	resp, err := traceClient.Export(context.Background(), req)
+	logClient := makeLogsServiceClient(t, logSink)
+	resp, err := logClient.Export(context.Background(), req)
 	require.NoError(t, err, "Failed to export trace: %v", err)
 	require.NotNil(t, resp, "The response is missing")
 
 	lds := logSink.AllLogs()
 	require.Len(t, lds, 1)
-	assert.EqualValues(t, logData, lds[0])
+	assert.EqualValues(t, ld, lds[0])
 }
 
 func TestExport_EmptyRequest(t *testing.T) {
 	logSink := new(consumertest.LogsSink)
 
-	addr, doneFn := otlpReceiverOnGRPCServer(t, logSink)
-	defer doneFn()
-
-	logClient, logClientDoneFn, err := makeLogsServiceClient(addr)
-	require.NoError(t, err, "Failed to create the TraceServiceClient: %v", err)
-	defer logClientDoneFn()
-
-	resp, err := logClient.Export(context.Background(), otlpgrpc.NewLogsRequest())
-	assert.NoError(t, err, "Failed to export trace: %v", err)
+	logClient := makeLogsServiceClient(t, logSink)
+	resp, err := logClient.Export(context.Background(), plogotlp.NewExportRequest())
+	require.NoError(t, err, "Failed to export trace: %v", err)
 	assert.NotNil(t, resp, "The response is missing")
 }
 
-func TestExport_ErrorConsumer(t *testing.T) {
-	addr, doneFn := otlpReceiverOnGRPCServer(t, consumertest.NewErr(errors.New("my error")))
-	defer doneFn()
+func TestExport_NonPermanentErrorConsumer(t *testing.T) {
+	ld := testdata.GenerateLogs(1)
+	req := plogotlp.NewExportRequestFromLogs(ld)
 
-	logClient, logClientDoneFn, err := makeLogsServiceClient(addr)
-	require.NoError(t, err, "Failed to create the TraceServiceClient: %v", err)
-	defer logClientDoneFn()
-
-	ld := testdata.GenerateLogsOneLogRecord()
-	req := otlpgrpc.NewLogsRequest()
-	req.SetLogs(ld)
-
+	logClient := makeLogsServiceClient(t, consumertest.NewErr(errors.New("my error")))
 	resp, err := logClient.Export(context.Background(), req)
-	assert.EqualError(t, err, "rpc error: code = Unknown desc = my error")
-	assert.Equal(t, otlpgrpc.LogsResponse{}, resp)
+	require.EqualError(t, err, "rpc error: code = Unavailable desc = my error")
+	assert.IsType(t, status.Error(codes.Unknown, ""), err)
+	assert.Equal(t, plogotlp.ExportResponse{}, resp)
 }
 
-func makeLogsServiceClient(addr net.Addr) (otlpgrpc.LogsClient, func(), error) {
-	cc, err := grpc.Dial(addr.String(), grpc.WithInsecure(), grpc.WithBlock())
-	if err != nil {
-		return nil, nil, err
-	}
+func TestExport_PermanentErrorConsumer(t *testing.T) {
+	ld := testdata.GenerateLogs(1)
+	req := plogotlp.NewExportRequestFromLogs(ld)
 
-	logClient := otlpgrpc.NewLogsClient(cc)
-
-	doneFn := func() { _ = cc.Close() }
-	return logClient, doneFn, nil
+	logClient := makeLogsServiceClient(t, consumertest.NewErr(consumererror.NewPermanent(errors.New("my error"))))
+	resp, err := logClient.Export(context.Background(), req)
+	require.EqualError(t, err, "rpc error: code = Internal desc = Permanent error: my error")
+	assert.IsType(t, status.Error(codes.Unknown, ""), err)
+	assert.Equal(t, plogotlp.ExportResponse{}, resp)
 }
 
-func otlpReceiverOnGRPCServer(t *testing.T, tc consumer.Logs) (net.Addr, func()) {
+func makeLogsServiceClient(t *testing.T, lc consumer.Logs) plogotlp.GRPCClient {
+	addr := otlpReceiverOnGRPCServer(t, lc)
+	cc, err := grpc.NewClient(addr.String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err, "Failed to create the TraceServiceClient: %v", err)
+	t.Cleanup(func() {
+		require.NoError(t, cc.Close())
+	})
+
+	return plogotlp.NewGRPCClient(cc)
+}
+
+func otlpReceiverOnGRPCServer(t *testing.T, lc consumer.Logs) net.Addr {
 	ln, err := net.Listen("tcp", "localhost:")
 	require.NoError(t, err, "Failed to find an available address to run the gRPC server: %v", err)
 
-	doneFnList := []func(){func() { ln.Close() }}
-	done := func() {
-		for _, doneFn := range doneFnList {
-			doneFn()
-		}
-	}
+	t.Cleanup(func() {
+		require.NoError(t, ln.Close())
+	})
 
-	r := New(config.NewComponentIDWithName("otlp", "log"), tc)
+	set := receivertest.NewNopSettings()
+	set.ID = component.MustNewIDWithName("otlp", "log")
+	obsreport, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+		ReceiverID:             set.ID,
+		Transport:              "grpc",
+		ReceiverCreateSettings: set,
+	})
 	require.NoError(t, err)
-
+	r := New(lc, obsreport)
 	// Now run it as a gRPC server
 	srv := grpc.NewServer()
-	otlpgrpc.RegisterLogsServer(srv, r)
+	plogotlp.RegisterGRPCServer(srv, r)
 	go func() {
 		_ = srv.Serve(ln)
 	}()
 
-	return ln.Addr(), done
+	return ln.Addr()
 }

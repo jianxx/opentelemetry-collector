@@ -1,22 +1,13 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+
 package exporterhelper
 
 import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,63 +16,77 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	nooptrace "go.opentelemetry.io/otel/trace/noop"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/consumer/consumerhelper"
-	"go.opentelemetry.io/collector/internal/obsreportconfig/obsmetrics"
-	"go.opentelemetry.io/collector/internal/testdata"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/obsreport/obsreporttest"
+	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/exporter/internal/storagetest"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/testdata"
 )
 
 const (
 	fakeLogsParentSpanName = "fake_logs_parent_span_name"
 )
 
-var fakeLogsExporterName = config.NewComponentIDWithName("fake_logs_exporter", "with_name")
-
 var (
-	fakeLogsExporterConfig = config.NewExporterSettings(fakeLogsExporterName)
+	fakeLogsName   = component.MustNewIDWithName("fake_logs_exporter", "with_name")
+	fakeLogsConfig = struct{}{}
 )
 
 func TestLogsRequest(t *testing.T) {
-	lr := newLogsRequest(context.Background(), testdata.GenerateLogsOneLogRecord(), nil)
+	lr := newLogsRequest(testdata.GenerateLogs(1), nil)
 
-	logErr := consumererror.NewLogs(errors.New("some error"), pdata.NewLogs())
+	logErr := consumererror.NewLogs(errors.New("some error"), plog.NewLogs())
 	assert.EqualValues(
 		t,
-		newLogsRequest(context.Background(), pdata.NewLogs(), nil),
-		lr.onError(logErr),
+		newLogsRequest(plog.NewLogs(), nil),
+		lr.(RequestErrorHandler).OnError(logErr),
 	)
 }
 
-func TestLogsExporter_InvalidName(t *testing.T) {
-	le, err := NewLogsExporter(nil, componenttest.NewNopExporterCreateSettings(), newPushLogsData(nil))
+func TestLogs_InvalidName(t *testing.T) {
+	le, err := NewLogs(context.Background(), exportertest.NewNopSettings(), nil, newPushLogsData(nil))
 	require.Nil(t, le)
 	require.Equal(t, errNilConfig, err)
 }
 
-func TestLogsExporter_NilLogger(t *testing.T) {
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, component.ExporterCreateSettings{}, newPushLogsData(nil))
+func TestLogs_NilLogger(t *testing.T) {
+	le, err := NewLogs(context.Background(), exporter.Settings{}, &fakeLogsConfig, newPushLogsData(nil))
 	require.Nil(t, le)
 	require.Equal(t, errNilLogger, err)
 }
 
-func TestLogsExporter_NilPushLogsData(t *testing.T) {
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, componenttest.NewNopExporterCreateSettings(), nil)
+func TestLogsRequest_NilLogger(t *testing.T) {
+	le, err := NewLogsRequest(context.Background(), exporter.Settings{}, internal.RequestFromLogsFunc(nil))
+	require.Nil(t, le)
+	require.Equal(t, errNilLogger, err)
+}
+
+func TestLogs_NilPushLogsData(t *testing.T) {
+	le, err := NewLogs(context.Background(), exportertest.NewNopSettings(), &fakeLogsConfig, nil)
 	require.Nil(t, le)
 	require.Equal(t, errNilPushLogsData, err)
 }
 
-func TestLogsExporter_Default(t *testing.T) {
-	ld := pdata.NewLogs()
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, componenttest.NewNopExporterCreateSettings(), newPushLogsData(nil))
+func TestLogsRequest_NilLogsConverter(t *testing.T) {
+	le, err := NewLogsRequest(context.Background(), exportertest.NewNopSettings(), nil)
+	require.Nil(t, le)
+	require.Equal(t, errNilLogsConverter, err)
+}
+
+func TestLogs_Default(t *testing.T) {
+	ld := plog.NewLogs()
+	le, err := NewLogs(context.Background(), exportertest.NewNopSettings(), &fakeLogsConfig, newPushLogsData(nil))
 	assert.NotNil(t, le)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	assert.Equal(t, consumer.Capabilities{MutatesData: false}, le.Capabilities())
 	assert.NoError(t, le.Start(context.Background(), componenttest.NewNopHost()))
@@ -89,127 +94,303 @@ func TestLogsExporter_Default(t *testing.T) {
 	assert.NoError(t, le.Shutdown(context.Background()))
 }
 
-func TestLogsExporter_WithCapabilities(t *testing.T) {
+func TestLogsRequest_Default(t *testing.T) {
+	ld := plog.NewLogs()
+	le, err := NewLogsRequest(context.Background(), exportertest.NewNopSettings(),
+		internal.RequestFromLogsFunc(nil))
+	assert.NotNil(t, le)
+	require.NoError(t, err)
+
+	assert.Equal(t, consumer.Capabilities{MutatesData: false}, le.Capabilities())
+	assert.NoError(t, le.Start(context.Background(), componenttest.NewNopHost()))
+	assert.NoError(t, le.ConsumeLogs(context.Background(), ld))
+	assert.NoError(t, le.Shutdown(context.Background()))
+}
+
+func TestLogs_WithCapabilities(t *testing.T) {
 	capabilities := consumer.Capabilities{MutatesData: true}
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, componenttest.NewNopExporterCreateSettings(), newPushLogsData(nil), WithCapabilities(capabilities))
+	le, err := NewLogs(context.Background(), exportertest.NewNopSettings(), &fakeLogsConfig, newPushLogsData(nil), WithCapabilities(capabilities))
 	require.NoError(t, err)
 	require.NotNil(t, le)
 
 	assert.Equal(t, capabilities, le.Capabilities())
 }
 
-func TestLogsExporter_Default_ReturnError(t *testing.T) {
-	ld := pdata.NewLogs()
+func TestLogsRequest_WithCapabilities(t *testing.T) {
+	capabilities := consumer.Capabilities{MutatesData: true}
+	le, err := NewLogsRequest(context.Background(), exportertest.NewNopSettings(),
+		internal.RequestFromLogsFunc(nil), WithCapabilities(capabilities))
+	require.NoError(t, err)
+	require.NotNil(t, le)
+
+	assert.Equal(t, capabilities, le.Capabilities())
+}
+
+func TestLogs_Default_ReturnError(t *testing.T) {
+	ld := plog.NewLogs()
 	want := errors.New("my_error")
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, componenttest.NewNopExporterCreateSettings(), newPushLogsData(want))
+	le, err := NewLogs(context.Background(), exportertest.NewNopSettings(), &fakeLogsConfig, newPushLogsData(want))
 	require.NoError(t, err)
 	require.NotNil(t, le)
 	require.Equal(t, want, le.ConsumeLogs(context.Background(), ld))
 }
 
-func TestLogsExporter_WithRecordLogs(t *testing.T) {
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, componenttest.NewNopExporterCreateSettings(), newPushLogsData(nil))
+func TestLogsRequest_Default_ConvertError(t *testing.T) {
+	ld := plog.NewLogs()
+	want := errors.New("convert_error")
+	le, err := NewLogsRequest(context.Background(), exportertest.NewNopSettings(),
+		func(context.Context, plog.Logs) (Request, error) {
+			return nil, want
+		})
+	require.NoError(t, err)
+	require.NotNil(t, le)
+	require.Equal(t, consumererror.NewPermanent(want), le.ConsumeLogs(context.Background(), ld))
+}
+
+func TestLogsRequest_Default_ExportError(t *testing.T) {
+	ld := plog.NewLogs()
+	want := errors.New("export_error")
+	le, err := NewLogsRequest(context.Background(), exportertest.NewNopSettings(),
+		internal.RequestFromLogsFunc(want))
+	require.NoError(t, err)
+	require.NotNil(t, le)
+	require.Equal(t, want, le.ConsumeLogs(context.Background(), ld))
+}
+
+func TestLogs_WithPersistentQueue(t *testing.T) {
+	qCfg := NewDefaultQueueConfig()
+	storageID := component.MustNewIDWithName("file_storage", "storage")
+	qCfg.StorageID = &storageID
+	rCfg := configretry.NewDefaultBackOffConfig()
+	ts := consumertest.LogsSink{}
+	set := exportertest.NewNopSettings()
+	set.ID = component.MustNewIDWithName("test_logs", "with_persistent_queue")
+	te, err := NewLogs(context.Background(), set, &fakeLogsConfig, ts.ConsumeLogs, WithRetry(rCfg), WithQueue(qCfg))
+	require.NoError(t, err)
+
+	host := &internal.MockHost{Ext: map[component.ID]component.Component{
+		storageID: storagetest.NewMockStorageExtension(nil),
+	}}
+	require.NoError(t, te.Start(context.Background(), host))
+	t.Cleanup(func() { require.NoError(t, te.Shutdown(context.Background())) })
+
+	traces := testdata.GenerateLogs(2)
+	require.NoError(t, te.ConsumeLogs(context.Background(), traces))
+	require.Eventually(t, func() bool {
+		return len(ts.AllLogs()) == 1 && ts.LogRecordCount() == 2
+	}, 500*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestLogs_WithRecordMetrics(t *testing.T) {
+	tt, err := componenttest.SetupTelemetry(fakeLogsName)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tt.Shutdown(context.Background())) })
+
+	le, err := NewLogs(context.Background(), exporter.Settings{ID: fakeLogsName, TelemetrySettings: tt.TelemetrySettings(), BuildInfo: component.NewDefaultBuildInfo()}, &fakeLogsConfig, newPushLogsData(nil))
 	require.NoError(t, err)
 	require.NotNil(t, le)
 
-	checkRecordedMetricsForLogsExporter(t, le, nil)
+	checkRecordedMetricsForLogs(t, tt, le, nil)
 }
 
-func TestLogsExporter_WithRecordLogs_ReturnError(t *testing.T) {
+func TestLogs_pLogModifiedDownStream_WithRecordMetrics(t *testing.T) {
+	tt, err := componenttest.SetupTelemetry(fakeLogsName)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tt.Shutdown(context.Background())) })
+
+	le, err := NewLogs(context.Background(), exporter.Settings{ID: fakeLogsName, TelemetrySettings: tt.TelemetrySettings(), BuildInfo: component.NewDefaultBuildInfo()}, &fakeLogsConfig, newPushLogsDataModifiedDownstream(nil), WithCapabilities(consumer.Capabilities{MutatesData: true}))
+	assert.NotNil(t, le)
+	require.NoError(t, err)
+	ld := testdata.GenerateLogs(2)
+
+	require.NoError(t, le.ConsumeLogs(context.Background(), ld))
+	assert.Equal(t, 0, ld.LogRecordCount())
+	require.NoError(t, tt.CheckExporterLogs(int64(2), 0))
+}
+
+func TestLogsRequest_WithRecordMetrics(t *testing.T) {
+	tt, err := componenttest.SetupTelemetry(fakeLogsName)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tt.Shutdown(context.Background())) })
+
+	le, err := NewLogsRequest(context.Background(),
+		exporter.Settings{ID: fakeLogsName, TelemetrySettings: tt.TelemetrySettings(), BuildInfo: component.NewDefaultBuildInfo()},
+		internal.RequestFromLogsFunc(nil))
+	require.NoError(t, err)
+	require.NotNil(t, le)
+
+	checkRecordedMetricsForLogs(t, tt, le, nil)
+}
+
+func TestLogs_WithRecordMetrics_ReturnError(t *testing.T) {
 	want := errors.New("my_error")
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, componenttest.NewNopExporterCreateSettings(), newPushLogsData(want))
-	require.Nil(t, err)
+	tt, err := componenttest.SetupTelemetry(fakeLogsName)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tt.Shutdown(context.Background())) })
+
+	le, err := NewLogs(context.Background(), exporter.Settings{ID: fakeLogsName, TelemetrySettings: tt.TelemetrySettings(), BuildInfo: component.NewDefaultBuildInfo()}, &fakeLogsConfig, newPushLogsData(want))
+	require.NoError(t, err)
 	require.NotNil(t, le)
 
-	checkRecordedMetricsForLogsExporter(t, le, want)
+	checkRecordedMetricsForLogs(t, tt, le, want)
 }
 
-func TestLogsExporter_WithRecordEnqueueFailedMetrics(t *testing.T) {
-	set, err := obsreporttest.SetupRecordedMetricsTest()
+func TestLogsRequest_WithRecordMetrics_ExportError(t *testing.T) {
+	want := errors.New("export_error")
+	tt, err := componenttest.SetupTelemetry(fakeLogsName)
 	require.NoError(t, err)
-	defer set.Shutdown(context.Background())
+	t.Cleanup(func() { require.NoError(t, tt.Shutdown(context.Background())) })
 
-	rCfg := DefaultRetrySettings()
-	qCfg := DefaultQueueSettings()
+	le, err := NewLogsRequest(context.Background(), exporter.Settings{ID: fakeLogsName, TelemetrySettings: tt.TelemetrySettings(), BuildInfo: component.NewDefaultBuildInfo()},
+		internal.RequestFromLogsFunc(want))
+	require.NoError(t, err)
+	require.NotNil(t, le)
+
+	checkRecordedMetricsForLogs(t, tt, le, want)
+}
+
+func TestLogs_WithRecordEnqueueFailedMetrics(t *testing.T) {
+	tt, err := componenttest.SetupTelemetry(fakeLogsName)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tt.Shutdown(context.Background())) })
+
+	rCfg := configretry.NewDefaultBackOffConfig()
+	qCfg := NewDefaultQueueConfig()
 	qCfg.NumConsumers = 1
 	qCfg.QueueSize = 2
 	wantErr := errors.New("some-error")
-	te, err := NewLogsExporter(&fakeLogsExporterConfig, set.ToExporterCreateSettings(), newPushLogsData(wantErr), WithRetry(rCfg), WithQueue(qCfg))
+	te, err := NewLogs(context.Background(), exporter.Settings{ID: fakeLogsName, TelemetrySettings: tt.TelemetrySettings(), BuildInfo: component.NewDefaultBuildInfo()}, &fakeLogsConfig, newPushLogsData(wantErr), WithRetry(rCfg), WithQueue(qCfg))
 	require.NoError(t, err)
 	require.NotNil(t, te)
 
-	md := testdata.GenerateLogsTwoLogRecordsSameResourceOneDifferent()
+	md := testdata.GenerateLogs(3)
 	const numBatches = 7
 	for i := 0; i < numBatches; i++ {
-		te.ConsumeLogs(context.Background(), md)
+		// errors are checked in the checkEnqueueFailedLogsStats function below.
+		_ = te.ConsumeLogs(context.Background(), md)
 	}
 
 	// 2 batched must be in queue, and 5 batches (15 log records) rejected due to queue overflow
-	checkExporterEnqueueFailedLogsStats(t, fakeLogsExporterName, int64(15))
+	require.NoError(t, tt.CheckExporterEnqueueFailedLogs(int64(15)))
 }
 
-func TestLogsExporter_WithSpan(t *testing.T) {
-	set := componenttest.NewNopExporterCreateSettings()
+func TestLogs_WithSpan(t *testing.T) {
+	set := exportertest.NewNopSettings()
 	sr := new(tracetest.SpanRecorder)
 	set.TracerProvider = sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	otel.SetTracerProvider(set.TracerProvider)
-	defer otel.SetTracerProvider(trace.NewNoopTracerProvider())
+	defer otel.SetTracerProvider(nooptrace.NewTracerProvider())
 
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, set, newPushLogsData(nil))
-	require.Nil(t, err)
+	le, err := NewLogs(context.Background(), set, &fakeLogsConfig, newPushLogsData(nil))
+	require.NoError(t, err)
 	require.NotNil(t, le)
-	checkWrapSpanForLogsExporter(t, sr, set.TracerProvider.Tracer("test"), le, nil, 1)
+	checkWrapSpanForLogs(t, sr, set.TracerProvider.Tracer("test"), le, nil)
 }
 
-func TestLogsExporter_WithSpan_ReturnError(t *testing.T) {
-	set := componenttest.NewNopExporterCreateSettings()
+func TestLogsRequest_WithSpan(t *testing.T) {
+	set := exportertest.NewNopSettings()
 	sr := new(tracetest.SpanRecorder)
 	set.TracerProvider = sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	otel.SetTracerProvider(set.TracerProvider)
-	defer otel.SetTracerProvider(trace.NewNoopTracerProvider())
+	defer otel.SetTracerProvider(nooptrace.NewTracerProvider())
+
+	le, err := NewLogsRequest(context.Background(), set, internal.RequestFromLogsFunc(nil))
+	require.NoError(t, err)
+	require.NotNil(t, le)
+	checkWrapSpanForLogs(t, sr, set.TracerProvider.Tracer("test"), le, nil)
+}
+
+func TestLogs_WithSpan_ReturnError(t *testing.T) {
+	set := exportertest.NewNopSettings()
+	sr := new(tracetest.SpanRecorder)
+	set.TracerProvider = sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	otel.SetTracerProvider(set.TracerProvider)
+	defer otel.SetTracerProvider(nooptrace.NewTracerProvider())
 
 	want := errors.New("my_error")
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, set, newPushLogsData(want))
-	require.Nil(t, err)
+	le, err := NewLogs(context.Background(), set, &fakeLogsConfig, newPushLogsData(want))
+	require.NoError(t, err)
 	require.NotNil(t, le)
-	checkWrapSpanForLogsExporter(t, sr, set.TracerProvider.Tracer("test"), le, want, 1)
+	checkWrapSpanForLogs(t, sr, set.TracerProvider.Tracer("test"), le, want)
 }
 
-func TestLogsExporter_WithShutdown(t *testing.T) {
+func TestLogsRequest_WithSpan_ReturnError(t *testing.T) {
+	set := exportertest.NewNopSettings()
+	sr := new(tracetest.SpanRecorder)
+	set.TracerProvider = sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	otel.SetTracerProvider(set.TracerProvider)
+	defer otel.SetTracerProvider(nooptrace.NewTracerProvider())
+
+	want := errors.New("my_error")
+	le, err := NewLogsRequest(context.Background(), set, internal.RequestFromLogsFunc(want))
+	require.NoError(t, err)
+	require.NotNil(t, le)
+	checkWrapSpanForLogs(t, sr, set.TracerProvider.Tracer("test"), le, want)
+}
+
+func TestLogs_WithShutdown(t *testing.T) {
 	shutdownCalled := false
 	shutdown := func(context.Context) error { shutdownCalled = true; return nil }
 
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, componenttest.NewNopExporterCreateSettings(), newPushLogsData(nil), WithShutdown(shutdown))
+	le, err := NewLogs(context.Background(), exportertest.NewNopSettings(), &fakeLogsConfig, newPushLogsData(nil), WithShutdown(shutdown))
 	assert.NotNil(t, le)
 	assert.NoError(t, err)
 
-	assert.Nil(t, le.Shutdown(context.Background()))
+	assert.NoError(t, le.Shutdown(context.Background()))
 	assert.True(t, shutdownCalled)
 }
 
-func TestLogsExporter_WithShutdown_ReturnError(t *testing.T) {
-	want := errors.New("my_error")
-	shutdownErr := func(context.Context) error { return want }
+func TestLogsRequest_WithShutdown(t *testing.T) {
+	shutdownCalled := false
+	shutdown := func(context.Context) error { shutdownCalled = true; return nil }
 
-	le, err := NewLogsExporter(&fakeLogsExporterConfig, componenttest.NewNopExporterCreateSettings(), newPushLogsData(nil), WithShutdown(shutdownErr))
+	le, err := NewLogsRequest(context.Background(), exportertest.NewNopSettings(),
+		internal.RequestFromLogsFunc(nil), WithShutdown(shutdown))
 	assert.NotNil(t, le)
 	assert.NoError(t, err)
 
-	assert.Equal(t, le.Shutdown(context.Background()), want)
+	assert.NoError(t, le.Shutdown(context.Background()))
+	assert.True(t, shutdownCalled)
 }
 
-func newPushLogsData(retError error) consumerhelper.ConsumeLogsFunc {
-	return func(ctx context.Context, td pdata.Logs) error {
+func TestLogs_WithShutdown_ReturnError(t *testing.T) {
+	want := errors.New("my_error")
+	shutdownErr := func(context.Context) error { return want }
+
+	le, err := NewLogs(context.Background(), exportertest.NewNopSettings(), &fakeLogsConfig, newPushLogsData(nil), WithShutdown(shutdownErr))
+	assert.NotNil(t, le)
+	require.NoError(t, err)
+
+	assert.Equal(t, want, le.Shutdown(context.Background()))
+}
+
+func TestLogsRequest_WithShutdown_ReturnError(t *testing.T) {
+	want := errors.New("my_error")
+	shutdownErr := func(context.Context) error { return want }
+
+	le, err := NewLogsRequest(context.Background(), exportertest.NewNopSettings(),
+		internal.RequestFromLogsFunc(nil), WithShutdown(shutdownErr))
+	assert.NotNil(t, le)
+	require.NoError(t, err)
+
+	assert.Equal(t, want, le.Shutdown(context.Background()))
+}
+
+func newPushLogsDataModifiedDownstream(retError error) consumer.ConsumeLogsFunc {
+	return func(_ context.Context, log plog.Logs) error {
+		log.ResourceLogs().MoveAndAppendTo(plog.NewResourceLogsSlice())
 		return retError
 	}
 }
 
-func checkRecordedMetricsForLogsExporter(t *testing.T, le component.LogsExporter, wantError error) {
-	set, err := obsreporttest.SetupRecordedMetricsTest()
-	require.NoError(t, err)
-	defer set.Shutdown(context.Background())
+func newPushLogsData(retError error) consumer.ConsumeLogsFunc {
+	return func(_ context.Context, _ plog.Logs) error {
+		return retError
+	}
+}
 
-	ld := testdata.GenerateLogsTwoLogRecordsSameResource()
+func checkRecordedMetricsForLogs(t *testing.T, tt componenttest.TestTelemetry, le exporter.Logs, wantError error) {
+	ld := testdata.GenerateLogs(2)
 	const numBatches = 7
 	for i := 0; i < numBatches; i++ {
 		require.Equal(t, wantError, le.ConsumeLogs(context.Background(), ld))
@@ -217,14 +398,14 @@ func checkRecordedMetricsForLogsExporter(t *testing.T, le component.LogsExporter
 
 	// TODO: When the new metrics correctly count partial dropped fix this.
 	if wantError != nil {
-		require.NoError(t, obsreporttest.CheckExporterLogs(fakeLogsExporterName, 0, int64(numBatches*ld.LogRecordCount())))
+		require.NoError(t, tt.CheckExporterLogs(0, int64(numBatches*ld.LogRecordCount())))
 	} else {
-		require.NoError(t, obsreporttest.CheckExporterLogs(fakeLogsExporterName, int64(numBatches*ld.LogRecordCount()), 0))
+		require.NoError(t, tt.CheckExporterLogs(int64(numBatches*ld.LogRecordCount()), 0))
 	}
 }
 
-func generateLogsTraffic(t *testing.T, tracer trace.Tracer, le component.LogsExporter, numRequests int, wantError error) {
-	ld := testdata.GenerateLogsOneLogRecord()
+func generateLogsTraffic(t *testing.T, tracer trace.Tracer, le exporter.Logs, numRequests int, wantError error) {
+	ld := testdata.GenerateLogs(1)
 	ctx, span := tracer.Start(context.Background(), fakeLogsParentSpanName)
 	defer span.End()
 	for i := 0; i < numRequests; i++ {
@@ -232,27 +413,27 @@ func generateLogsTraffic(t *testing.T, tracer trace.Tracer, le component.LogsExp
 	}
 }
 
-func checkWrapSpanForLogsExporter(t *testing.T, sr *tracetest.SpanRecorder, tracer trace.Tracer, le component.LogsExporter, wantError error, numLogRecords int64) {
+func checkWrapSpanForLogs(t *testing.T, sr *tracetest.SpanRecorder, tracer trace.Tracer, le exporter.Logs, wantError error) {
 	const numRequests = 5
 	generateLogsTraffic(t, tracer, le, numRequests, wantError)
 
 	// Inspection time!
 	gotSpanData := sr.Ended()
-	require.Equal(t, numRequests+1, len(gotSpanData))
+	require.Len(t, gotSpanData, numRequests+1)
 
 	parentSpan := gotSpanData[numRequests]
 	require.Equalf(t, fakeLogsParentSpanName, parentSpan.Name(), "SpanData %v", parentSpan)
 	for _, sd := range gotSpanData[:numRequests] {
 		require.Equalf(t, parentSpan.SpanContext(), sd.Parent(), "Exporter span not a child\nSpanData %v", sd)
-		checkStatus(t, sd, wantError)
+		internal.CheckStatus(t, sd, wantError)
 
-		sentLogRecords := numLogRecords
-		var failedToSendLogRecords int64
+		sentLogRecords := int64(1)
+		failedToSendLogRecords := int64(0)
 		if wantError != nil {
 			sentLogRecords = 0
-			failedToSendLogRecords = numLogRecords
+			failedToSendLogRecords = 1
 		}
-		require.Containsf(t, sd.Attributes(), attribute.KeyValue{Key: obsmetrics.SentLogRecordsKey, Value: attribute.Int64Value(sentLogRecords)}, "SpanData %v", sd)
-		require.Containsf(t, sd.Attributes(), attribute.KeyValue{Key: obsmetrics.FailedToSendLogRecordsKey, Value: attribute.Int64Value(failedToSendLogRecords)}, "SpanData %v", sd)
+		require.Containsf(t, sd.Attributes(), attribute.KeyValue{Key: internal.ItemsSent, Value: attribute.Int64Value(sentLogRecords)}, "SpanData %v", sd)
+		require.Containsf(t, sd.Attributes(), attribute.KeyValue{Key: internal.ItemsFailed, Value: attribute.Int64Value(failedToSendLogRecords)}, "SpanData %v", sd)
 	}
 }
