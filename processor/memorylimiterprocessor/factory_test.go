@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package memorylimiterprocessor
 
@@ -21,10 +10,17 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
+	"go.opentelemetry.io/collector/component/componentattribute"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config/configtest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/internal/memorylimiter"
+	"go.opentelemetry.io/collector/pipeline"
+	"go.opentelemetry.io/collector/processor/processortest"
 )
 
 func TestCreateDefaultConfig(t *testing.T) {
@@ -33,7 +29,7 @@ func TestCreateDefaultConfig(t *testing.T) {
 
 	cfg := factory.CreateDefaultConfig()
 	assert.NotNil(t, cfg, "failed to create default config")
-	assert.NoError(t, configtest.CheckConfigStruct(cfg))
+	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
 }
 
 func TestCreateProcessor(t *testing.T) {
@@ -42,38 +38,56 @@ func TestCreateProcessor(t *testing.T) {
 
 	cfg := factory.CreateDefaultConfig()
 
-	// This processor can't be created with the default config.
-	tp, err := factory.CreateTracesProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, consumertest.NewNop())
-	assert.Nil(t, tp)
-	assert.Error(t, err, "created processor with invalid settings")
-
-	mp, err := factory.CreateMetricsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, consumertest.NewNop())
-	assert.Nil(t, mp)
-	assert.Error(t, err, "created processor with invalid settings")
-
-	lp, err := factory.CreateLogsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, consumertest.NewNop())
-	assert.Nil(t, lp)
-	assert.Error(t, err, "created processor with invalid settings")
-
 	// Create processor with a valid config.
 	pCfg := cfg.(*Config)
 	pCfg.MemoryLimitMiB = 5722
 	pCfg.MemorySpikeLimitMiB = 1907
-	pCfg.BallastSizeMiB = 2048
 	pCfg.CheckInterval = 100 * time.Millisecond
 
-	tp, err = factory.CreateTracesProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, consumertest.NewNop())
-	assert.NoError(t, err)
+	core, observer := observer.New(zapcore.DebugLevel)
+	attrs := attribute.NewSet(
+		attribute.String(componentattribute.SignalKey, pipeline.SignalLogs.String()),
+		attribute.String(componentattribute.ComponentIDKey, "memorylimiter"),
+		attribute.String(componentattribute.PipelineIDKey, "logs/foo"),
+	)
+	set := processortest.NewNopSettings()
+	set.Logger = componentattribute.NewLogger(zap.New(core), &attrs)
+
+	tp, err := factory.CreateTraces(context.Background(), set, cfg, consumertest.NewNop())
+	require.NoError(t, err)
 	assert.NotNil(t, tp)
-	assert.NoError(t, tp.Shutdown(context.Background()))
+	// test if we can shutdown a monitoring routine that has not started
+	require.ErrorIs(t, tp.Shutdown(context.Background()), memorylimiter.ErrShutdownNotStarted)
+	require.NoError(t, tp.Start(context.Background(), componenttest.NewNopHost()))
 
-	mp, err = factory.CreateMetricsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, consumertest.NewNop())
-	assert.NoError(t, err)
+	mp, err := factory.CreateMetrics(context.Background(), set, cfg, consumertest.NewNop())
+	require.NoError(t, err)
 	assert.NotNil(t, mp)
-	assert.NoError(t, mp.Shutdown(context.Background()))
+	require.NoError(t, mp.Start(context.Background(), componenttest.NewNopHost()))
 
-	lp, err = factory.CreateLogsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, consumertest.NewNop())
-	assert.NoError(t, err)
+	lp, err := factory.CreateLogs(context.Background(), set, cfg, consumertest.NewNop())
+	require.NoError(t, err)
 	assert.NotNil(t, lp)
+	assert.NoError(t, lp.Start(context.Background(), componenttest.NewNopHost()))
+
 	assert.NoError(t, lp.Shutdown(context.Background()))
+	assert.NoError(t, tp.Shutdown(context.Background()))
+	assert.NoError(t, mp.Shutdown(context.Background()))
+	// verify that no monitoring routine is running
+	require.ErrorIs(t, tp.Shutdown(context.Background()), memorylimiter.ErrShutdownNotStarted)
+
+	// start and shutdown a new monitoring routine
+	assert.NoError(t, lp.Start(context.Background(), componenttest.NewNopHost()))
+	assert.NoError(t, lp.Shutdown(context.Background()))
+	// calling it again should throw an error
+	require.ErrorIs(t, lp.Shutdown(context.Background()), memorylimiter.ErrShutdownNotStarted)
+
+	var createLoggerCount int
+	for _, log := range observer.All() {
+		if log.Message == "created singleton logger" {
+			createLoggerCount++
+			assert.Empty(t, observer.All()[0].Context)
+		}
+	}
+	assert.Equal(t, 1, createLoggerCount)
 }
