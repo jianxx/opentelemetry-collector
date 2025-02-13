@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package metrics
 
@@ -23,32 +12,27 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/consumer/consumertest"
-	"go.opentelemetry.io/collector/internal/testdata"
-	"go.opentelemetry.io/collector/model/otlpgrpc"
+	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/collector/pdata/testdata"
+	"go.opentelemetry.io/collector/receiver/otlpreceiver/internal/metadata"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
+	"go.opentelemetry.io/collector/receiver/receivertest"
 )
 
 func TestExport(t *testing.T) {
+	md := testdata.GenerateMetrics(1)
+	req := pmetricotlp.NewExportRequestFromMetrics(md)
+
 	metricSink := new(consumertest.MetricsSink)
-
-	port, doneFn := otlpReceiverOnGRPCServer(t, metricSink)
-	defer doneFn()
-
-	metricsClient, metricsClientDoneFn, err := makeMetricsServiceClient(port)
-	require.NoError(t, err, "Failed to create the MetricsServiceClient: %v", err)
-	defer metricsClientDoneFn()
-
-	md := testdata.GenerateMetricsOneMetric()
-
-	// Keep metric data to compare the test result against it
-	// Clone needed because OTLP proto XXX_ fields are altered in the GRPC downstream
-	metricData := md.Clone()
-
-	req := otlpgrpc.NewMetricsRequest()
-	req.SetMetrics(md)
+	metricsClient := makeMetricsServiceClient(t, metricSink)
 	resp, err := metricsClient.Export(context.Background(), req)
 
 	require.NoError(t, err, "Failed to export metrics: %v", err)
@@ -56,71 +40,74 @@ func TestExport(t *testing.T) {
 
 	mds := metricSink.AllMetrics()
 	require.Len(t, mds, 1)
-	assert.EqualValues(t, metricData, mds[0])
+	assert.EqualValues(t, md, mds[0])
 }
 
 func TestExport_EmptyRequest(t *testing.T) {
 	metricSink := new(consumertest.MetricsSink)
-
-	addr, doneFn := otlpReceiverOnGRPCServer(t, metricSink)
-	defer doneFn()
-
-	metricsClient, metricsClientDoneFn, err := makeMetricsServiceClient(addr)
-	require.NoError(t, err, "Failed to create the MetricsServiceClient: %v", err)
-	defer metricsClientDoneFn()
-
-	resp, err := metricsClient.Export(context.Background(), otlpgrpc.NewMetricsRequest())
+	metricsClient := makeMetricsServiceClient(t, metricSink)
+	resp, err := metricsClient.Export(context.Background(), pmetricotlp.NewExportRequest())
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 }
 
-func TestExport_ErrorConsumer(t *testing.T) {
-	addr, doneFn := otlpReceiverOnGRPCServer(t, consumertest.NewErr(errors.New("my error")))
-	defer doneFn()
+func TestExport_NonPermanentErrorConsumer(t *testing.T) {
+	md := testdata.GenerateMetrics(1)
+	req := pmetricotlp.NewExportRequestFromMetrics(md)
 
-	metricsClient, metricsClientDoneFn, err := makeMetricsServiceClient(addr)
-	require.NoError(t, err, "Failed to create the MetricsServiceClient: %v", err)
-	defer metricsClientDoneFn()
-
-	md := testdata.GenerateMetricsOneMetric()
-	req := otlpgrpc.NewMetricsRequest()
-	req.SetMetrics(md)
-
+	metricsClient := makeMetricsServiceClient(t, consumertest.NewErr(errors.New("my error")))
 	resp, err := metricsClient.Export(context.Background(), req)
-	assert.EqualError(t, err, "rpc error: code = Unknown desc = my error")
-	assert.Equal(t, otlpgrpc.MetricsResponse{}, resp)
+	require.EqualError(t, err, "rpc error: code = Unavailable desc = my error")
+	assert.IsType(t, status.Error(codes.Unknown, ""), err)
+	assert.Equal(t, pmetricotlp.ExportResponse{}, resp)
 }
 
-func makeMetricsServiceClient(addr net.Addr) (otlpgrpc.MetricsClient, func(), error) {
-	cc, err := grpc.Dial(addr.String(), grpc.WithInsecure(), grpc.WithBlock())
-	if err != nil {
-		return nil, nil, err
-	}
+func TestExport_PermanentErrorConsumer(t *testing.T) {
+	ld := testdata.GenerateMetrics(1)
+	req := pmetricotlp.NewExportRequestFromMetrics(ld)
 
-	metricsClient := otlpgrpc.NewMetricsClient(cc)
-
-	doneFn := func() { _ = cc.Close() }
-	return metricsClient, doneFn, nil
+	metricsClient := makeMetricsServiceClient(t, consumertest.NewErr(consumererror.NewPermanent(errors.New("my error"))))
+	resp, err := metricsClient.Export(context.Background(), req)
+	require.EqualError(t, err, "rpc error: code = Internal desc = Permanent error: my error")
+	assert.IsType(t, status.Error(codes.Unknown, ""), err)
+	assert.Equal(t, pmetricotlp.ExportResponse{}, resp)
 }
 
-func otlpReceiverOnGRPCServer(t *testing.T, mc consumer.Metrics) (net.Addr, func()) {
+func makeMetricsServiceClient(t *testing.T, mc consumer.Metrics) pmetricotlp.GRPCClient {
+	addr := otlpReceiverOnGRPCServer(t, mc)
+
+	cc, err := grpc.NewClient(addr.String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err, "Failed to create the MetricsServiceClient: %v", err)
+	t.Cleanup(func() {
+		require.NoError(t, cc.Close())
+	})
+
+	return pmetricotlp.NewGRPCClient(cc)
+}
+
+func otlpReceiverOnGRPCServer(t *testing.T, mc consumer.Metrics) net.Addr {
 	ln, err := net.Listen("tcp", "localhost:")
 	require.NoError(t, err, "Failed to find an available address to run the gRPC server: %v", err)
 
-	doneFnList := []func(){func() { ln.Close() }}
-	done := func() {
-		for _, doneFn := range doneFnList {
-			doneFn()
-		}
-	}
+	t.Cleanup(func() {
+		require.NoError(t, ln.Close())
+	})
 
-	r := New(config.NewComponentIDWithName("otlp", "metrics"), mc)
+	set := receivertest.NewNopSettingsWithType(metadata.Type)
+	set.ID = component.MustNewIDWithName("otlp", "metrics")
+	obsreport, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+		ReceiverID:             set.ID,
+		Transport:              "grpc",
+		ReceiverCreateSettings: set,
+	})
+	require.NoError(t, err)
+	r := New(mc, obsreport)
 	// Now run it as a gRPC server
 	srv := grpc.NewServer()
-	otlpgrpc.RegisterMetricsServer(srv, r)
+	pmetricotlp.RegisterGRPCServer(srv, r)
 	go func() {
 		_ = srv.Serve(ln)
 	}()
 
-	return ln.Addr(), done
+	return ln.Addr()
 }
