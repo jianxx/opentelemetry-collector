@@ -7,6 +7,67 @@ If you are looking for developer-facing changes, check out [CHANGELOG-API.md](./
 
 <!-- next version -->
 
+## v1.35.0/v0.129.0
+
+### 🛑 Breaking changes 🛑
+
+- `exporterhelper`: Remove deprecated sending_queue::blocking options, use sending_queue::block_on_overflow. (#13211)
+
+### 💡 Enhancements 💡
+
+- `mdatagen`: Taught mdatagen to print the `go list` stderr output on failures, and to run `go list` where the metadata file is. (#13205)
+- `service`: Support setting `sampler` and `limits` under `service::telemetry::traces` (#13201)
+  This allows users to enable sampling and set span limits on internal Collector traces using the
+  OpenTelemetry SDK declarative configuration.
+  
+- `pdata/pprofile`: Add new helper methods `FromLocationIndices` and `PutLocation` to read and modify the content of locations. (#13150)
+- `exporterhelper`: Preserve request span context and client information in the persistent queue. (#11740, #13220, #13232)
+  It allows internal collector spans and client information to propagate through the persistent queue used by 
+  the exporters. The same way as it's done for the in-memory queue.
+  Currently, it is behind the exporter.PersistRequestContext feature gate, which can be enabled by adding 
+  `--feature-gates=exporter.PersistRequestContext` to the collector command line. An exporter buffer stored by
+  a previous version of the collector (or by a collector with the feature gate disabled) can be read by a newer
+  collector with the feature enabled. However, the reverse is not supported: a buffer stored by a newer collector with
+  the feature enabled cannot be read by an older collector (or by a collector with the feature gate disabled).
+  
+
+### 🧰 Bug fixes 🧰
+
+- `pdata`: Fix copying of optional fields when the source is unset. (#13268)
+- `service`: Only allocate one set of internal log sampling counters (#13014)
+  The case where logs are only exported to stdout was fixed in v0.126.0;
+  this new fix also covers the case where logs are exported through OTLP.
+  
+
+<!-- previous-version -->
+
+## v1.34.0/v0.128.0
+
+### 🛑 Breaking changes 🛑
+
+- `service/telemetry`: Mark "telemetry.disableAddressFieldForInternalTelemetry" as stable (#13152)
+
+### 💡 Enhancements 💡
+
+- `confighttp`: Update the HTTP server span naming to use the HTTP method and route pattern instead of the path. (#12468)
+  The HTTP server span name will now be formatted as `<http.request.method> <http.route>`.
+  If a route pattern is not available, it will fall back to `<http.request.method>`.
+  
+- `service`: Use configured loggers to log errors as soon as it is available (#13081)
+- `service`: Remove stabilized featuregate useOtelWithSDKConfigurationForInternalTelemetry (#13152)
+
+### 🧰 Bug fixes 🧰
+
+- `telemetry`: Add generated resource attributes to the printed log messages. (#13110)
+  If service.name, service.version, or service.instance.id are not specified in the config, they will be generated automatically.
+  This change ensures that these attributes are also included in the printed log messages.
+  
+- `mdatagen`: Fix generation when there are no events in the metadata. (#13123)
+- `confmap`: Do not panic on assigning nil maps to non-nil maps (#13117)
+- `pdata`: Fix event_name skipped when unmarshalling LogRecord from JSON (#13127)
+
+<!-- previous-version -->
+
 ## v1.33.0/v0.127.0
 
 ### 🚩 Deprecations 🚩
